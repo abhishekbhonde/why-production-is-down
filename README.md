@@ -22,30 +22,48 @@ You wake up knowing exactly what to fix.
 Alert fires (PagerDuty / Datadog webhook)
           │
           ▼
-┌─────────────────────┐
-│   Webhook Receiver  │  Validates signature, deduplicates alerts
-└────────┬────────────┘
-         │
-         ▼
-┌──────────────────────────────────────────────────────────┐
-│                    Agent Orchestrator                    │
-│                                                          │
-│  1. Extract alert context (service, time, severity)      │
-│  2. Determine investigation window (T-30min to now)      │
-│  3. Fan out parallel data fetching:                      │
-│     ├── Metrics & APM        → Datadog                   │
-│     ├── Error groups         → Sentry                    │
-│     ├── Logs                 → CloudWatch / Datadog      │
-│     └── Recent deploys       → GitHub / CI pipeline      │
-│  4. Correlate timeline across all sources                │
-│  5. Identify root cause — deploy SHA, diff, author       │
-└────────┬─────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│   Notification Hub  │  → Slack message with full report
-│                     │  → PagerDuty incident note
-└─────────────────────┘
+┌─────────────────────────────────────┐
+│         Webhook Receiver            │
+│  - Validates webhook signature      │
+│  - Checks Redis for duplicate alert │◄── Redis (dedup + state)
+│  - Drops if same incident < 5min    │
+└────────────────┬────────────────────┘
+                 │
+                 ▼
+┌────────────────────────────────────────────────────────────┐
+│                    Agent Orchestrator                      │
+│                                                            │
+│  1. Parse alert: service name, severity, timestamp         │
+│  2. Set investigation window: [T-30min → T+5min]          │
+│     (expands to T-2hr if no signal found in initial pass) │
+│  3. Fan out parallel data fetching:                        │
+│     ├── Metrics & APM        → Datadog                     │
+│     ├── Error groups         → Sentry                      │
+│     ├── Application logs     → CloudWatch / Datadog Logs   │
+│     ├── Recent deploys       → GitHub / CI pipeline        │
+│     └── DB health            → RDS / CloudWatch metrics    │
+│  4. Correlate timeline — find the earliest anomaly signal  │
+│  5. Test hypotheses in priority order:                     │
+│     a. Recent deploy within 30min of first failure?        │
+│     b. Upstream service degraded at same time?             │
+│     c. Database connection pool exhausted?                 │
+│     d. Traffic spike / resource saturation?                │
+│     e. Infrastructure event (AZ, spot termination)?        │
+│  6. Fetch diff if deploy found; fetch dependency graph     │
+│     if cascade failure suspected                           │
+│  7. Produce structured root cause report                   │
+└────────────────┬───────────────────────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────┐
+│          Notification Hub           │
+│  → Slack DM + channel alert         │
+│  → PagerDuty incident note          │
+│  → (Phase 3+) Jira ticket creation  │
+│                                     │
+│  Fallback: if Slack is unreachable, │
+│  writes report to S3 + sends email  │
+└─────────────────────────────────────┘
 ```
 
 ---
@@ -54,12 +72,13 @@ Alert fires (PagerDuty / Datadog webhook)
 
 ```
 INCIDENT SUMMARY
-─────────────────────────────────────────
+─────────────────────────────────────────────────────────────
 Service:        payment-service
 First failure:  2024-01-15 02:47:03 UTC
-Alert fired:    2024-01-15 02:51:00 UTC (4 min lag)
+Alert fired:    2024-01-15 02:51:00 UTC  (4 min detection lag)
+Investigation:  completed in 58 seconds
 
-Cause: 500 error rate spiked from 0.1% → 34% on POST /webhooks/stripe
+Cause: HTTP 500 error rate spiked from 0.1% → 34% on POST /webhooks/stripe
 
 Likely culprit: Deploy #892 by @jsmith at 02:43 UTC
   Commit: fix(stripe): update webhook signature validation
@@ -67,39 +86,88 @@ Likely culprit: Deploy #892 by @jsmith at 02:43 UTC
 
 Relevant diff:
   - const sig = req.headers['stripe-signature']
-  + const sig = req.headers['x-stripe-signature']  ← header name incorrect
+  + const sig = req.headers['x-stripe-signature']   ← wrong header name
+
+Other services affected: checkout-service, order-service (downstream cascade)
+DB health: normal  |  Upstream APIs: normal  |  Infrastructure: normal
+
+Confidence: HIGH — deploy timing + diff explain the failure directly
 
 Recommended action: Roll back deploy #892 or revert the header name change.
-─────────────────────────────────────────
+─────────────────────────────────────────────────────────────
 ```
+
+---
+
+## Edge Cases Handled
+
+### No recent deploy found
+If no deploy occurred within 30 minutes of the first failure, the agent shifts to checking:
+- Upstream service health (did a dependency degrade first?)
+- Database connection pool exhaustion or slow query explosion
+- Infrastructure events (AZ outage, spot instance termination, autoscaling failure)
+- Traffic pattern anomalies (sudden spike, DDoS-like pattern)
+- Feature flag rollout timing (LaunchDarkly / custom flag systems)
+
+The report will reflect low confidence and list the best available hypothesis.
+
+### Cascade failure (multiple services failing simultaneously)
+The agent identifies the **earliest failing service** by comparing first-error timestamps across all affected services. The root cause investigation focuses on that service, and downstream impact is listed separately.
+
+### Flapping alerts (alert fires, clears, fires again)
+Redis deduplication treats all alerts for the same service within a 5-minute window as one incident. A flapping alert does not trigger multiple parallel investigations. The agent notes the flap pattern in its report.
+
+### Diff too large to be useful
+When a deploy contains thousands of changed lines (e.g., a dependency upgrade or bulk rename), the agent flags this and focuses on files most likely related to the failure path based on the error stack trace.
+
+### Investigation window too narrow
+If the initial 30-minute window yields no signal, the window automatically expands to 2 hours. If still no signal, the report explicitly states "no correlating event found in 2-hour window" rather than guessing.
+
+### Source unavailable during investigation
+Each adapter has a 10-second timeout and fails independently. If Sentry is down, the investigation continues without it. The final report lists which sources were unreachable so the reader knows what data is missing.
+
+### Slack unreachable during an incident
+If Slack delivery fails, the report is written to an S3 bucket and a fallback email is sent via SES. The S3 object URL is included in the PagerDuty incident note.
+
+### Redis unavailable
+If Redis is unreachable at alert time, the deduplication step is skipped and the investigation runs anyway. A warning is added to the report. Duplicate investigations may occur during Redis outages.
+
+### Alert storm (10+ alerts firing in under 60 seconds)
+The agent processes the first alert immediately and queues the rest via SQS with a 60-second delay. If the incident is resolved before queued alerts are processed, they are dropped.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Language | Python 3.12 |
-| Web framework | FastAPI |
-| Queue / dedup | Redis |
-| Metrics source | Datadog |
-| Error tracking | Sentry |
-| Log source | AWS CloudWatch |
-| Deploy tracking | GitHub API |
-| Alerting input | PagerDuty |
-| Notification output | Slack |
-| Deployment | AWS Lambda / Fly.io |
+| Layer | Technology | Reason |
+|-------|-----------|--------|
+| Language | Python 3.12 | Async-first, rich API client ecosystem |
+| Web framework | FastAPI | Async, low overhead, webhook signature validation |
+| Task queue | SQS | Alert storm buffering, retry on failure |
+| Dedup / state | Redis | Sub-millisecond dedup, TTL-based expiry |
+| Metrics source | Datadog | APM, metrics, log search in one API |
+| Error tracking | Sentry | Error groups, releases, stack traces |
+| Log source | AWS CloudWatch | Lambda/ECS logs, RDS metrics |
+| Deploy tracking | GitHub API | Commit diffs, tags, PR metadata |
+| Alerting input | PagerDuty | Webhook trigger, incident annotation |
+| Notification output | Slack | Incident report delivery |
+| Fallback storage | AWS S3 | Report persistence when Slack is down |
+| Deployment | AWS Lambda / Fly.io | Event-driven, scales to zero |
 
 ---
 
 ## Integrations
 
-- **Datadog** — metrics, APM traces, log search
-- **Sentry** — error groups, stack traces, release tracking
-- **AWS CloudWatch** — Lambda/ECS logs and alarms
-- **GitHub** — commit diffs, deploy tags, PR history
-- **PagerDuty** — alert ingestion and incident annotations
-- **Slack** — incident report delivery
+- **Datadog** — error rate metrics, APM traces, log search
+- **Sentry** — error groups, stack traces, release and deploy tracking
+- **AWS CloudWatch** — Lambda/ECS/RDS logs, alarms, and metric streams
+- **AWS RDS** — database health, connection count, slow query metrics
+- **GitHub** — commit diffs, deploy tags, pull request history
+- **PagerDuty** — alert ingestion, incident annotations, on-call routing
+- **Slack** — incident report delivery with thread replies for updates
+- **AWS SQS** — alert buffering and retry
+- **AWS S3** — fallback report storage
+- **LaunchDarkly** *(Phase 2+)* — feature flag change history correlation
 
 ---
 
@@ -109,28 +177,42 @@ Recommended action: Roll back deploy #892 or revert the header name change.
 why-production-is-down/
 ├── src/
 │   ├── agent/
-│   │   ├── orchestrator.py      # Core agent loop
-│   │   ├── tools.py             # Tool definitions
-│   │   └── prompts.py           # Investigation prompts
+│   │   ├── orchestrator.py      # Core agent loop, hypothesis testing
+│   │   ├── tools.py             # Tool definitions (one per data source)
+│   │   └── prompts.py           # Investigation system prompt
 │   ├── adapters/
-│   │   ├── datadog.py
-│   │   ├── sentry.py
-│   │   ├── cloudwatch.py
-│   │   ├── github.py
-│   │   └── pagerduty.py
+│   │   ├── base.py              # Abstract adapter interface + timeout wrapper
+│   │   ├── datadog.py           # Metrics, APM, logs
+│   │   ├── sentry.py            # Error groups, releases
+│   │   ├── cloudwatch.py        # AWS logs and alarms
+│   │   ├── rds.py               # Database health metrics
+│   │   ├── github.py            # Deploys, diffs, PR metadata
+│   │   └── pagerduty.py         # Alert parsing, incident annotation
 │   ├── notifiers/
-│   │   └── slack.py
+│   │   ├── slack.py             # Primary: Slack report delivery
+│   │   ├── email.py             # Fallback: SES email
+│   │   └── s3.py                # Fallback: S3 report persistence
 │   ├── server/
-│   │   └── webhook.py           # FastAPI webhook receiver
+│   │   └── webhook.py           # FastAPI: PagerDuty + Datadog receivers
 │   └── utils/
-│       ├── dedup.py             # Redis deduplication
-│       └── timeline.py          # Time correlation helpers
+│       ├── dedup.py             # Redis deduplication logic
+│       ├── timeline.py          # Cross-source event correlation
+│       ├── truncate.py          # Log/diff size limiting before LLM call
+│       └── rate_limit.py        # Per-adapter rate limit tracking
 ├── tests/
-│   ├── fixtures/                # Recorded API responses for testing
-│   └── test_agent.py
+│   ├── fixtures/
+│   │   ├── datadog_metrics.json
+│   │   ├── sentry_errors.json
+│   │   ├── github_deploys.json
+│   │   └── cloudwatch_logs.json
+│   ├── test_orchestrator.py
+│   ├── test_adapters.py
+│   ├── test_dedup.py
+│   └── test_timeline.py
 ├── deploy/
 │   ├── lambda_handler.py        # AWS Lambda entrypoint
-│   └── Dockerfile
+│   ├── Dockerfile               # Fly.io / ECS container
+│   └── terraform/               # Infrastructure as code (Lambda + SQS + Redis)
 ├── .env.example
 ├── pyproject.toml
 └── README.md
@@ -141,36 +223,103 @@ why-production-is-down/
 ## Implementation Phases
 
 ### Phase 1 — Skeleton
-- Webhook receiver with signature validation
-- Redis deduplication
-- Agent loop with mock data adapters
-- End-to-end Slack output
+- [ ] FastAPI webhook receiver with PagerDuty and Datadog signature validation
+- [ ] Redis deduplication (same alert within 5 minutes = one investigation)
+- [ ] Agent loop with stubbed adapters returning fixture data
+- [ ] Hypothesis testing logic with prioritized root cause search
+- [ ] Slack output with structured report format
+
+**Goal:** End-to-end flow works with fixture data. No real API calls.
 
 ### Phase 2 — Real Integrations
-- Live Datadog, Sentry, GitHub, CloudWatch adapters
-- Tested against real incidents in staging
+- [ ] Live Datadog adapter: error rate metrics + log search
+- [ ] Live Sentry adapter: error groups + release tracking
+- [ ] Live GitHub adapter: deploy tags + commit diffs
+- [ ] Live CloudWatch adapter: ECS/Lambda logs + RDS metrics
+- [ ] Rate limit handling for all adapters (Datadog: 300 req/hr, GitHub: 5000 req/hr)
+- [ ] Validated against 3 real past incidents in staging
+
+**Goal:** Correctly identify root cause for real historical incidents.
 
 ### Phase 3 — Reliability
-- 90-second investigation timeout budget
-- Graceful degradation when sources are unavailable
-- Token/cost tracking per investigation
+- [ ] 90-second hard timeout on full investigation
+- [ ] Per-adapter 10-second timeout with graceful skip
+- [ ] Alert storm handling via SQS queue with 60-second delay
+- [ ] S3 + email fallback if Slack delivery fails
+- [ ] Investigation window auto-expansion (30min → 2hr) on no-signal
+- [ ] Cost tracking: log token count and estimated cost per investigation
+
+**Goal:** Production-ready. Handles all edge cases without human intervention.
 
 ### Phase 4 — Learning
-- Store investigation → outcome pairs
-- Slack feedback buttons (was the root cause correct?)
-- Prompt tuning based on misses
+- [ ] Persist `(investigation, outcome)` pairs to a database
+- [ ] "Was this correct?" Slack button (thumbs up / thumbs down)
+- [ ] Weekly accuracy report: % of incidents where root cause was correct
+- [ ] Tune investigation prompts based on systematic misses
+- [ ] Auto-annotate PagerDuty incidents that were resolved by rolling back the identified deploy
 
 ---
 
 ## Key Design Decisions
 
-**Parallel fetching, sequential reasoning** — all API calls run concurrently. Only the reasoning step is sequential. Keeps data collection under 15 seconds.
+**Parallel fetching, sequential reasoning**
+All API calls run concurrently via `asyncio.gather`. Only the reasoning step is sequential. Keeps data collection under 15 seconds even with 5+ sources.
 
-**Fixed investigation window** — always `[alert_time - 30min, alert_time + 5min]`. Prevents runaway API costs.
+**Dynamic investigation window**
+Starts at `[alert_time - 30min, alert_time + 5min]`. Expands to `[alert_time - 2hr, alert_time + 5min]` if no signal is found. Prevents runaway API costs while not missing slow-burn incidents.
 
-**Deploy correlation first** — 80% of incidents trace to a recent deploy. This hypothesis is checked first.
+**Hypotheses tested in priority order**
+Recent deploy → upstream failure → database → traffic spike → infrastructure. The most common causes are tested first. The agent stops as soon as it finds a high-confidence root cause.
 
-**No autonomous remediation in v1** — the agent recommends action, humans approve it. Trust is built incrementally.
+**Hard token budget per investigation**
+Logs are capped at 200 lines, diffs at 300 lines, metrics at 100 data points before being sent for analysis. Prevents runaway costs on log-heavy services. Cap limits are configurable per adapter.
+
+**No autonomous remediation in v1**
+The agent recommends action but does not execute it. Rollbacks and restarts require a human to approve. Trust is built through demonstrated accuracy before automation is added.
+
+**Adapter isolation**
+Each adapter fails independently. A Sentry outage does not abort the investigation — it just removes one data source. The final report lists any sources that were unavailable.
+
+---
+
+## Rate Limits Reference
+
+| Source | Limit | Agent behavior |
+|--------|-------|---------------|
+| Datadog Metrics API | 300 requests/hour | Batch metric queries, cache results within investigation |
+| Datadog Logs API | 300 requests/hour | Single query per investigation, truncate to 200 lines |
+| Sentry API | 100 requests/second | No issue in normal operation |
+| GitHub REST API | 5,000 requests/hour | No issue in normal operation |
+| GitHub GraphQL API | 5,000 points/hour | Prefer REST for diffs |
+| PagerDuty API | 900 requests/minute | No issue in normal operation |
+
+---
+
+## Cost Estimate
+
+Per investigation (typical incident):
+
+| Item | Estimate |
+|------|---------|
+| LLM input tokens | ~8,000–15,000 tokens |
+| LLM output tokens | ~500–1,000 tokens |
+| API calls (all sources) | ~15–25 calls |
+| Total LLM cost | ~$0.04–$0.10 per investigation |
+| AWS Lambda runtime | ~$0.0001 per investigation |
+
+At 50 incidents/month: approximately $2–5/month in LLM costs.
+
+---
+
+## Prerequisites
+
+Before running this project you need:
+
+- Python 3.12+
+- Redis 7.0+ (local or managed, e.g. Redis Cloud, Elasticache)
+- Active accounts and API keys for: Datadog, Sentry, GitHub, PagerDuty, Slack
+- AWS account (for CloudWatch, SQS, S3, Lambda deployment)
+- A GitHub repo with deploy tags or a CI system that creates them
 
 ---
 
@@ -180,14 +329,41 @@ why-production-is-down/
 # Clone and install
 git clone https://github.com/abhishekbhonde/why-production-is-down.git
 cd why-production-is-down
+
+# Create a virtual environment
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies (once pyproject.toml is in place)
 pip install -e .
 
-# Configure
+# Configure environment
 cp .env.example .env
-# Fill in your API keys
+# Edit .env with your API keys
 
-# Run locally
+# Start Redis locally (if not already running)
+redis-server
+
+# Run in mock mode (uses fixture data, no real API calls)
+MOCK_MODE=true uvicorn src.server.webhook:app --reload
+
+# Run with real integrations
 uvicorn src.server.webhook:app --reload
+```
+
+### Sending a test alert locally
+
+```bash
+curl -X POST http://localhost:8000/webhook/pagerduty \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event": "incident.trigger",
+    "incident": {
+      "service": {"name": "payment-service"},
+      "created_at": "2024-01-15T02:51:00Z",
+      "title": "High error rate on payment-service"
+    }
+  }'
 ```
 
 ---
@@ -196,16 +372,59 @@ uvicorn src.server.webhook:app --reload
 
 ```env
 # .env.example
+
+# Datadog
 DATADOG_API_KEY=
 DATADOG_APP_KEY=
+DATADOG_SITE=datadoghq.com        # or datadoghq.eu for EU customers
+
+# Sentry
 SENTRY_AUTH_TOKEN=
-SENTRY_ORG=
-GITHUB_TOKEN=
+SENTRY_ORG=                        # your Sentry organization slug
+SENTRY_PROJECT=                    # project slug to query
+
+# GitHub
+GITHUB_TOKEN=                      # needs repo:read scope
+GITHUB_ORG=                        # your GitHub organization name
+
+# PagerDuty
 PAGERDUTY_TOKEN=
+PAGERDUTY_WEBHOOK_SECRET=          # for validating incoming webhook signatures
+
+# Slack
 SLACK_BOT_TOKEN=
-SLACK_CHANNEL_ID=
+SLACK_CHANNEL_ID=                  # channel to post incident reports
+
+# AWS (CloudWatch, SQS, S3, SES)
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+SQS_QUEUE_URL=
+S3_FALLBACK_BUCKET=
+SES_FROM_EMAIL=                    # fallback email sender
+
+# Redis
 REDIS_URL=redis://localhost:6379
+
+# Agent behavior
+MOCK_MODE=false                    # set true to use fixture data (no real API calls)
+INVESTIGATION_WINDOW_MINUTES=30    # initial lookback window
+MAX_LOG_LINES=200                  # log lines sent to the agent per query
+MAX_DIFF_LINES=300                 # diff lines sent per commit
+ADAPTER_TIMEOUT_SECONDS=10         # per-source timeout before skipping
+INVESTIGATION_TIMEOUT_SECONDS=90   # hard limit on full investigation
 ```
+
+---
+
+## Contributing
+
+1. Fork the repository
+2. Add fixture data to `tests/fixtures/` for any new adapter
+3. Write an adapter test that runs entirely against fixtures (no real API calls)
+4. Open a pull request
+
+Each adapter must implement the `BaseAdapter` interface defined in `src/adapters/base.py` and handle its own timeout and error suppression.
 
 ---
 
