@@ -1,0 +1,23 @@
+{
+  "error_groups": [
+    {
+      "id": "PAYMENT-123",
+      "title": "SignatureVerificationError: No signatures found matching the expected signature for payload",
+      "firstSeen": "2024-01-15T02:47:03",
+      "lastSeen": "2024-01-15T02:55:00",
+      "count": 847,
+      "level": "error",
+      "culprit": "payment_service/webhooks.py in validate_stripe_signature",
+      "tags": {
+        "endpoint": "POST /webhooks/stripe",
+        "http.status_code": "500"
+      }
+    }
+  ],
+  "release": {
+    "version": "deploy-892",
+    "dateCreated": "2024-01-15T02:43:00",
+    "deployedAt": "2024-01-15T02:43:00",
+    "firstEvent": "2024-01-15T02:47:03"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "log_events": [
+    {
+      "timestamp": "2024-01-15T02:47:03",
+      "message": "ERROR SignatureVerificationError: No signatures found matching the expected signature for payload",
+      "logGroup": "/ecs/payment-service",
+      "logStream": "payment-service/app/abc123"
+    },
+    {
+      "timestamp": "2024-01-15T02:47:04",
+      "message": "ERROR 500 POST /webhooks/stripe - SignatureVerificationError in 12ms",
+      "logGroup": "/ecs/payment-service",
+      "logStream": "payment-service/app/abc123"
+    },
+    {
+      "timestamp": "2024-01-15T02:47:05",
+      "message": "ERROR 500 POST /webhooks/stripe - SignatureVerificationError in 11ms",
+      "logGroup": "/ecs/payment-service",
+      "logStream": "payment-service/app/abc123"
+    }
+  ],
+  "total_events": 847,
+  "scanned_bytes": 284920
+}
