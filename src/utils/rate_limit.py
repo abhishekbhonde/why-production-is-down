@@ -6,7 +6,7 @@ it should be moved to Redis for multi-instance deployments.
 """
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 # Limits from the README
 RATE_LIMITS: dict[str, int] = {
@@ -30,7 +30,7 @@ def check_and_record(adapter: str) -> bool:
     if limit is None:
         return True
 
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     window_start = now - timedelta(hours=1)
 
     # Prune old entries
@@ -44,7 +44,7 @@ def check_and_record(adapter: str) -> bool:
 
 
 def current_usage(adapter: str) -> int:
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     window_start = now - timedelta(hours=1)
     _counts[adapter] = [ts for ts in _counts[adapter] if ts > window_start]
     return len(_counts[adapter])
