@@ -1,10 +1,13 @@
 import asyncio
 import json
+import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import anthropic
+
+logger = logging.getLogger(__name__)
 
 from src.adapters.base import AdapterResult
 from src.adapters.cloudwatch import CloudWatchAdapter
@@ -39,6 +42,9 @@ class InvestigationReport:
     recommended_action: str
     investigation_seconds: float
     raw_llm_response: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: float = 0.0
 
 
 class Orchestrator:
@@ -106,7 +112,21 @@ class Orchestrator:
         raw_response = message.content[0].text
         elapsed = time.monotonic() - started_at
 
-        report_data = self._parse_report(raw_response, alert, unavailable, elapsed)
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
+        # claude-opus-4-6 pricing: $15/M input, $75/M output
+        estimated_cost = (input_tokens * 15 + output_tokens * 75) / 1_000_000
+
+        logger.info(
+            "Investigation for %s complete — tokens: %d in / %d out, cost: $%.4f, elapsed: %.1fs",
+            alert.service,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            elapsed,
+        )
+
+        report_data = self._parse_report(raw_response, alert, unavailable, elapsed, input_tokens, output_tokens, estimated_cost)
         return report_data
 
     def _no_signal(self, results: list[AdapterResult]) -> bool:
@@ -122,6 +142,9 @@ class Orchestrator:
         alert: Alert,
         unavailable: list[str],
         elapsed: float,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        estimated_cost: float = 0.0,
     ) -> InvestigationReport:
         try:
             # Extract JSON block from LLM response
@@ -152,4 +175,7 @@ class Orchestrator:
             recommended_action=data.get("recommended_action", ""),
             investigation_seconds=round(elapsed, 2),
             raw_llm_response=raw,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=round(estimated_cost, 6),
         )

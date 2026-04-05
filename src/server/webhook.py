@@ -23,19 +23,36 @@ from src.notifiers import s3 as s3_notifier
 from src.notifiers import slack as slack_notifier
 from src.notifiers.slack import SlackDeliveryError
 from src.utils import dedup
+from src.utils import sqs as sqs_util
 
 logger = logging.getLogger(__name__)
 
 _redis_client: redis.Redis | None = None
 _orchestrator: Orchestrator | None = None
+_drain_task: asyncio.Task | None = None
+
+
+async def _sqs_drain_loop() -> None:
+    """Background loop that drains buffered SQS alerts every 10 seconds."""
+    while True:
+        try:
+            await sqs_util.drain_one(_redis_client, _orchestrator, _run_investigation)
+        except Exception:
+            logger.exception("Unexpected error in SQS drain loop")
+        await asyncio.sleep(10)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _redis_client, _orchestrator
+    global _redis_client, _orchestrator, _drain_task
     _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     _orchestrator = Orchestrator()
+    if settings.sqs_queue_url:
+        _drain_task = asyncio.create_task(_sqs_drain_loop())
+        logger.info("SQS drain loop started")
     yield
+    if _drain_task:
+        _drain_task.cancel()
     if _redis_client:
         await _redis_client.aclose()
 
@@ -142,7 +159,17 @@ async def pagerduty_webhook(
 
     assert _redis_client is not None
     if await dedup.is_duplicate(service_name, _redis_client):
-        return {"status": "deduplicated", "service": service_name}
+        enqueued = await sqs_util.enqueue(
+            service=service_name,
+            alert_time=alert_time,
+            description=description,
+            severity="critical",
+            incident_id=incident_id,
+        )
+        return {
+            "status": "buffered" if enqueued else "deduplicated",
+            "service": service_name,
+        }
 
     alert = Alert(
         service=service_name,
@@ -184,7 +211,17 @@ async def datadog_webhook(
 
     assert _redis_client is not None
     if await dedup.is_duplicate(service_name, _redis_client):
-        return {"status": "deduplicated", "service": service_name}
+        enqueued = await sqs_util.enqueue(
+            service=service_name,
+            alert_time=alert_time,
+            description=description,
+            severity="critical",
+            incident_id="",
+        )
+        return {
+            "status": "buffered" if enqueued else "deduplicated",
+            "service": service_name,
+        }
 
     alert = Alert(
         service=service_name,
