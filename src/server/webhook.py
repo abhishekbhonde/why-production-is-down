@@ -1,27 +1,34 @@
 """FastAPI webhook receiver.
 
 Endpoints:
-  POST /webhook/pagerduty   — PagerDuty event webhook
-  POST /webhook/datadog     — Datadog monitor alert webhook
-  GET  /health              — liveness probe
+  POST /webhook/pagerduty         — PagerDuty event webhook
+  POST /webhook/datadog           — Datadog monitor alert webhook
+  POST /webhook/slack/interactive — Slack button callbacks (thumbs up/down)
+  GET  /report/weekly             — Weekly accuracy report
+  GET  /health                    — liveness probe
 """
 
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
+from urllib.parse import parse_qs
 
 import redis.asyncio as redis
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
+from src.adapters.pagerduty import PagerDutyAdapter
 from src.agent.orchestrator import Alert, Orchestrator
 from src.config import settings
 from src.notifiers import email as email_notifier
 from src.notifiers import s3 as s3_notifier
 from src.notifiers import slack as slack_notifier
 from src.notifiers.slack import SlackDeliveryError
+from src.store import db as store
 from src.utils import dedup
 from src.utils import sqs as sqs_util
 
@@ -29,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _redis_client: redis.Redis | None = None
 _orchestrator: Orchestrator | None = None
+_pagerduty = PagerDutyAdapter()
 _drain_task: asyncio.Task | None = None
 
 
@@ -47,6 +55,7 @@ async def lifespan(app: FastAPI):
     global _redis_client, _orchestrator, _drain_task
     _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     _orchestrator = Orchestrator()
+    await store.init()
     if settings.sqs_queue_url:
         _drain_task = asyncio.create_task(_sqs_drain_loop())
         logger.info("SQS drain loop started")
@@ -69,7 +78,7 @@ def _verify_pagerduty_signature(body: bytes, signature_header: str | None) -> bo
         return True  # skip validation if secret not configured (dev mode)
     if not signature_header:
         return False
-    expected = hmac.new(  # hmac.new is the correct function name
+    expected = hmac.new(
         key=settings.pagerduty_webhook_secret.encode(),
         msg=body,
         digestmod=hashlib.sha256,
@@ -80,13 +89,43 @@ def _verify_pagerduty_signature(body: bytes, signature_header: str | None) -> bo
 def _verify_datadog_signature(body: bytes, signature_header: str | None) -> bool:
     # Datadog webhooks don't have a standard HMAC mechanism in basic webhooks;
     # validation is typically via a shared secret in the payload itself.
-    # TODO: implement when using Datadog webhook with custom headers.
     return True
+
+
+def _verify_slack_signature(body: bytes, signature_header: str | None, timestamp: str | None) -> bool:
+    """Verifies Slack request signature using the signing secret."""
+    slack_signing_secret = getattr(settings, "slack_signing_secret", "")
+    if not slack_signing_secret:
+        return True  # skip in dev mode
+    if not signature_header or not timestamp:
+        return False
+    base = f"v0:{timestamp}:{body.decode()}"
+    expected = "v0=" + hmac.new(
+        key=slack_signing_secret.encode(),
+        msg=base.encode(),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 
 # ---------------------------------------------------------------------------
 # Background investigation runner
 # ---------------------------------------------------------------------------
+
+def _build_pagerduty_note(report) -> str:
+    lines = [
+        f"Root cause: {report.root_cause}",
+        f"Confidence: {report.confidence}",
+    ]
+    culprit = report.culprit or {}
+    if culprit.get("detail"):
+        lines.append(f"Culprit: {culprit['detail']}")
+    if culprit.get("diff_url"):
+        lines.append(f"Diff: {culprit['diff_url']}")
+    lines.append(f"Recommended action: {report.recommended_action}")
+    lines.append(f"Investigation took {report.investigation_seconds}s")
+    return "\n".join(lines)
+
 
 async def _run_investigation(alert: Alert) -> None:
     assert _orchestrator is not None
@@ -99,8 +138,18 @@ async def _run_investigation(alert: Alert) -> None:
             timeout=settings.investigation_timeout_seconds,
         )
 
+        # Persist to DB
+        investigation_id = await store.save_investigation(report)
+
+        # Annotate PagerDuty incident
+        if alert.incident_id:
+            await _pagerduty.annotate_incident(
+                alert.incident_id, _build_pagerduty_note(report)
+            )
+
+        # Notify via Slack (with feedback buttons) or fall back to S3 + email
         try:
-            await slack_notifier.send(report)
+            await slack_notifier.send(report, investigation_id)
         except SlackDeliveryError as exc:
             logger.warning("Slack delivery failed (%s), falling back to S3 + email", exc)
             s3_url = await s3_notifier.upload(report)
@@ -126,6 +175,12 @@ async def _run_investigation(alert: Alert) -> None:
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/report/weekly")
+async def weekly_report() -> dict:
+    """Returns the accuracy report for the past 7 days."""
+    return await store.weekly_accuracy()
 
 
 @app.post("/webhook/pagerduty")
@@ -232,3 +287,48 @@ async def datadog_webhook(
 
     background_tasks.add_task(_run_investigation, alert)
     return {"status": "accepted", "service": service_name}
+
+
+@app.post("/webhook/slack/interactive")
+async def slack_interactive(
+    request: Request,
+    x_slack_signature: str | None = Header(default=None),
+    x_slack_request_timestamp: str | None = Header(default=None),
+) -> JSONResponse:
+    """Handles Slack interactive button callbacks (thumbs up / thumbs down).
+
+    Slack sends these as application/x-www-form-urlencoded with a 'payload'
+    field containing JSON.
+    """
+    body = await request.body()
+
+    if not _verify_slack_signature(body, x_slack_signature, x_slack_request_timestamp):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    # Decode form-encoded payload
+    form = parse_qs(body.decode())
+    payload_raw = form.get("payload", ["{}"])[0]
+    payload = json.loads(payload_raw)
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return JSONResponse(content={"status": "no_actions"})
+
+    action = actions[0]
+    action_id = action.get("action_id", "")
+    investigation_id = action.get("value", "")
+
+    if action_id == "feedback_correct":
+        verdict = "correct"
+    elif action_id == "feedback_incorrect":
+        verdict = "incorrect"
+    else:
+        return JSONResponse(content={"status": "unknown_action"})
+
+    if investigation_id:
+        await store.record_feedback(investigation_id, verdict)
+        logger.info("Feedback recorded via Slack: %s → %s", investigation_id, verdict)
+
+    # Respond to Slack immediately (required within 3s)
+    ack_text = ":white_check_mark: Thanks for the feedback!" if verdict == "correct" else ":notepad_spiral: Got it — marked as incorrect."
+    return JSONResponse(content={"text": ack_text})

@@ -26,7 +26,7 @@ class SlackDeliveryError(Exception):
     pass
 
 
-def _format_report(report: InvestigationReport) -> list[dict]:
+def _format_report(report: InvestigationReport, investigation_id: str = "") -> list[dict]:
     """Formats the report as Slack Block Kit blocks."""
     emoji = CONFIDENCE_EMOJI.get(report.confidence, ":question:")
 
@@ -78,12 +78,37 @@ def _format_report(report: InvestigationReport) -> list[dict]:
             }
         )
 
+    # Feedback buttons — only shown when investigation_id is known
+    if investigation_id:
+        blocks.append({"type": "divider"})
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": ":thumbsup: Correct"},
+                        "style": "primary",
+                        "action_id": "feedback_correct",
+                        "value": investigation_id,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": ":thumbsdown: Incorrect"},
+                        "style": "danger",
+                        "action_id": "feedback_incorrect",
+                        "value": investigation_id,
+                    },
+                ],
+            }
+        )
+
     return blocks
 
 
-async def send(report: InvestigationReport) -> None:
+async def send(report: InvestigationReport, investigation_id: str = "") -> None:
     if settings.mock_mode:
-        logger.info("[MOCK] Slack report:\n%s", _format_report(report))
+        logger.info("[MOCK] Slack report:\n%s", _format_report(report, investigation_id))
         return
 
     async with httpx.AsyncClient() as client:
@@ -92,7 +117,7 @@ async def send(report: InvestigationReport) -> None:
             headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
             json={
                 "channel": settings.slack_channel_id,
-                "blocks": _format_report(report),
+                "blocks": _format_report(report, investigation_id),
                 "text": f"Incident report for {report.service}: {report.root_cause}",
             },
             timeout=10,

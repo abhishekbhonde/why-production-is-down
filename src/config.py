@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # Slack
     slack_bot_token: str = ""
     slack_channel_id: str = ""
+    slack_signing_secret: str = ""
 
     # AWS
     aws_region: str = "us-east-1"
@@ -47,6 +48,9 @@ class Settings(BaseSettings):
 
     # Anthropic
     anthropic_api_key: str = ""
+
+    # Persistence
+    db_path: str = "data/incidents.db"
 
 
 settings = Settings()
