@@ -21,6 +21,7 @@ import redis.asyncio as redis
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from src.adapters.github import create_revert_pr
 from src.adapters.pagerduty import PagerDutyAdapter
 from src.agent.orchestrator import Alert, Orchestrator
 from src.config import settings
@@ -166,6 +167,28 @@ async def _run_investigation(alert: Alert) -> None:
         logger.exception("Unhandled error during investigation for %s", alert.service)
     finally:
         await dedup.clear(alert.service, _redis_client)
+
+
+# ---------------------------------------------------------------------------
+# Rollback helper
+# ---------------------------------------------------------------------------
+
+async def _do_rollback(sha: str, repo: str, channel_id: str, thread_ts: str) -> None:
+    """Creates a GitHub revert PR and posts the result back to the Slack thread."""
+    try:
+        pr_url = await create_revert_pr(repo, sha)
+        await slack_notifier.post_thread_reply(
+            channel_id,
+            thread_ts,
+            f":white_check_mark: Revert PR created: {pr_url}\nReview and merge to roll back the deploy.",
+        )
+    except Exception:
+        logger.exception("Failed to create revert PR for %s@%s", repo, sha)
+        await slack_notifier.post_thread_reply(
+            channel_id,
+            thread_ts,
+            ":x: Failed to create revert PR automatically. Please create one manually.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -316,19 +339,26 @@ async def slack_interactive(
 
     action = actions[0]
     action_id = action.get("action_id", "")
-    investigation_id = action.get("value", "")
+    value = action.get("value", "")
 
-    if action_id == "feedback_correct":
-        verdict = "correct"
-    elif action_id == "feedback_incorrect":
-        verdict = "incorrect"
-    else:
-        return JSONResponse(content={"status": "unknown_action"})
+    if action_id in ("feedback_correct", "feedback_incorrect"):
+        verdict = "correct" if action_id == "feedback_correct" else "incorrect"
+        if value:
+            await store.record_feedback(value, verdict)
+            logger.info("Feedback recorded via Slack: %s → %s", value, verdict)
+        ack_text = (
+            ":white_check_mark: Thanks for the feedback!"
+            if verdict == "correct"
+            else ":notepad_spiral: Got it — marked as incorrect."
+        )
+        return JSONResponse(content={"text": ack_text})
 
-    if investigation_id:
-        await store.record_feedback(investigation_id, verdict)
-        logger.info("Feedback recorded via Slack: %s → %s", investigation_id, verdict)
+    if action_id == "rollback_deploy":
+        # value format: "{sha}|{repo}"
+        sha, _, repo = value.partition("|")
+        channel_id = payload.get("container", {}).get("channel_id", "")
+        thread_ts = payload.get("container", {}).get("message_ts", "")
+        asyncio.create_task(_do_rollback(sha, repo, channel_id, thread_ts))
+        return JSONResponse(content={"text": ":hourglass_flowing_sand: Creating revert PR, hang tight..."})
 
-    # Respond to Slack immediately (required within 3s)
-    ack_text = ":white_check_mark: Thanks for the feedback!" if verdict == "correct" else ":notepad_spiral: Got it — marked as incorrect."
-    return JSONResponse(content={"text": ack_text})
+    return JSONResponse(content={"status": "unknown_action"})

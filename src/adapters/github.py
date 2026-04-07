@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -159,3 +160,87 @@ class GitHubAdapter(BaseAdapter):
             "url": payload.get("html_url", ""),
             "files_changed": truncated_files,
         }
+
+
+# ---------------------------------------------------------------------------
+# Remediation actions (write operations — not part of the read adapter)
+# ---------------------------------------------------------------------------
+
+async def create_revert_pr(repo: str, sha: str) -> str:
+    """Opens a draft revert PR for the given commit SHA.
+
+    Strategy:
+    1. Fetch the commit to get its parent SHA and message.
+    2. Check how many commits on main came *after* this SHA (ahead_by).
+       If > 0, include a warning in the PR body — merging will also
+       revert those newer commits.
+    3. Create a branch at the parent SHA.
+    4. Open a draft PR targeting main with a clear description.
+
+    Returns the PR HTML URL.
+    Raises httpx.HTTPStatusError on any API failure.
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        # 1. Resolve commit details
+        r = await client.get(
+            f"{_BASE}/repos/{repo}/commits/{sha}",
+            headers=_auth_headers(),
+        )
+        r.raise_for_status()
+        commit_data = r.json()
+        parents = commit_data.get("parents", [])
+        if not parents:
+            raise ValueError(f"Commit {sha} has no parents — cannot revert an initial commit")
+        parent_sha = parents[0]["sha"]
+        commit_message = commit_data["commit"]["message"].splitlines()[0]
+
+        # 2. Check how far main has advanced past this commit
+        r = await client.get(
+            f"{_BASE}/repos/{repo}/compare/{sha}...main",
+            headers=_auth_headers(),
+        )
+        r.raise_for_status()
+        ahead_by: int = r.json().get("ahead_by", 0)
+
+        # 3. Create revert branch at the parent SHA
+        branch_name = f"revert/{sha[:7]}-{int(time.time())}"
+        r = await client.post(
+            f"{_BASE}/repos/{repo}/git/refs",
+            headers=_auth_headers(),
+            json={"ref": f"refs/heads/{branch_name}", "sha": parent_sha},
+        )
+        r.raise_for_status()
+
+        # 4. Open a draft PR
+        warning = ""
+        if ahead_by > 0:
+            warning = (
+                f"\n\n> **Warning:** {ahead_by} commit(s) landed on `main` after "
+                f"`{sha[:7]}`. Merging this PR will also revert those changes. "
+                f"Consider a targeted `git revert` instead."
+            )
+
+        body = (
+            f"Automated revert of `{sha[:7]}` triggered by the incident agent.\n\n"
+            f"**Original commit:** {commit_message}\n"
+            f"**Strategy:** branch created at parent `{parent_sha[:7]}`"
+            f"{warning}\n\n"
+            f"This PR is in *draft* mode — review and mark ready to merge when confirmed safe."
+        )
+
+        r = await client.post(
+            f"{_BASE}/repos/{repo}/pulls",
+            headers=_auth_headers(),
+            json={
+                "title": f"revert: {commit_message[:72]}",
+                "head": branch_name,
+                "base": "main",
+                "body": body,
+                "draft": True,
+            },
+        )
+        r.raise_for_status()
+        pr_url: str = r.json()["html_url"]
+
+    logger.info("Revert PR created for %s@%s: %s", repo, sha[:7], pr_url)
+    return pr_url

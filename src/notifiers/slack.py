@@ -6,6 +6,7 @@ fall back to S3 + email.
 """
 
 import logging
+import re
 
 import httpx
 
@@ -24,6 +25,23 @@ CONFIDENCE_EMOJI = {
 
 class SlackDeliveryError(Exception):
     pass
+
+
+# Matches: https://github.com/{org}/{repo}/compare/{base}...{head}
+_GITHUB_COMPARE_RE = re.compile(
+    r"https://github\.com/([^/]+/[^/]+)/compare/[^.]+\.\.\.([0-9a-f]+)"
+)
+
+
+def _rollback_value(culprit: dict) -> str | None:
+    """Returns '{sha}|{repo}' if the culprit is a deploy with a parseable diff URL."""
+    if culprit.get("type") != "deploy":
+        return None
+    m = _GITHUB_COMPARE_RE.match(culprit.get("diff_url") or "")
+    if not m:
+        return None
+    repo, sha = m.group(1), m.group(2)
+    return f"{sha}|{repo}"
 
 
 def _format_report(report: InvestigationReport, investigation_id: str = "") -> list[dict]:
@@ -78,30 +96,51 @@ def _format_report(report: InvestigationReport, investigation_id: str = "") -> l
             }
         )
 
-    # Feedback buttons — only shown when investigation_id is known
+    # Action buttons — only shown when investigation_id is known
     if investigation_id:
         blocks.append({"type": "divider"})
-        blocks.append(
+
+        elements: list[dict] = [
             {
-                "type": "actions",
-                "elements": [
+                "type": "button",
+                "text": {"type": "plain_text", "text": ":thumbsup: Correct"},
+                "style": "primary",
+                "action_id": "feedback_correct",
+                "value": investigation_id,
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": ":thumbsdown: Incorrect"},
+                "style": "danger",
+                "action_id": "feedback_incorrect",
+                "value": investigation_id,
+            },
+        ]
+
+        # Rollback button — only for HIGH confidence deploy culprits with a diff URL
+        if report.confidence == "HIGH":
+            rollback_val = _rollback_value(report.culprit or {})
+            if rollback_val:
+                elements.append(
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": ":thumbsup: Correct"},
-                        "style": "primary",
-                        "action_id": "feedback_correct",
-                        "value": investigation_id,
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": ":thumbsdown: Incorrect"},
+                        "text": {"type": "plain_text", "text": ":rewind: Roll back deploy"},
                         "style": "danger",
-                        "action_id": "feedback_incorrect",
-                        "value": investigation_id,
-                    },
-                ],
-            }
-        )
+                        "action_id": "rollback_deploy",
+                        "value": rollback_val,
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "Create revert PR?"},
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "This will open a *draft* PR on GitHub that reverts the identified deploy. You still need to review and merge it.",
+                            },
+                            "confirm": {"type": "plain_text", "text": "Yes, create PR"},
+                            "deny": {"type": "plain_text", "text": "Cancel"},
+                        },
+                    }
+                )
+
+        blocks.append({"type": "actions", "elements": elements})
 
     return blocks
 
@@ -126,3 +165,22 @@ async def send(report: InvestigationReport, investigation_id: str = "") -> None:
     data = response.json()
     if not data.get("ok"):
         raise SlackDeliveryError(f"Slack API error: {data.get('error', 'unknown')}")
+
+
+async def post_thread_reply(channel: str, thread_ts: str, text: str) -> None:
+    """Posts a reply into an existing Slack message thread."""
+    if settings.mock_mode:
+        logger.info("[MOCK] Slack thread reply (%s): %s", thread_ts, text)
+        return
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+            json={"channel": channel, "thread_ts": thread_ts, "text": text},
+            timeout=10,
+        )
+
+    data = response.json()
+    if not data.get("ok"):
+        logger.warning("Failed to post Slack thread reply: %s", data.get("error", "unknown"))
