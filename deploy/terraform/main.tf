@@ -215,6 +215,8 @@ resource "aws_lambda_function" "agent" {
       SLACK_CHANNEL_ID            = var.slack_channel_id
       SLACK_SIGNING_SECRET        = var.slack_signing_secret
       SES_FROM_EMAIL              = var.ses_from_email
+      LAUNCHDARKLY_API_KEY        = var.launchdarkly_api_key
+      LAUNCHDARKLY_ENV            = var.launchdarkly_env
     }
   }
 

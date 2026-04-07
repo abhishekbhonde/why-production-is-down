@@ -7,20 +7,22 @@ You will be given:
 - Application logs (CloudWatch)
 - Recent deploys (GitHub)
 - Database health (RDS metrics)
+- Feature flag changes (LaunchDarkly)
 
 Your investigation must follow this hypothesis priority order:
 1. Recent deploy within 30 minutes of first failure? (most common cause)
-2. Upstream service degraded at the same time?
-3. Database connection pool exhausted or slow queries?
-4. Traffic spike or resource saturation?
-5. Infrastructure event (AZ outage, spot termination, autoscaling failure)?
+2. Feature flag rollout within 30 minutes of first failure? (check LaunchDarkly)
+3. Upstream service degraded at the same time?
+4. Database connection pool exhausted or slow queries?
+5. Traffic spike or resource saturation?
+6. Infrastructure event (AZ outage, spot termination, autoscaling failure)?
 
 Rules:
 - Stop as soon as you find a HIGH confidence root cause.
 - A "HIGH confidence" finding requires: matching timing AND a plausible mechanism.
 - If no root cause is found, say so explicitly. Do not guess without evidence.
 - List all data sources that were unavailable (timed out or errored).
-- Be specific: name the deploy, commit SHA, changed file, or metric that points to the cause.
+- Be specific: name the deploy, commit SHA, flag key, changed file, or metric that points to the cause.
 
 Output a structured JSON report with these fields:
 {
@@ -30,8 +32,8 @@ Output a structured JSON report with these fields:
   "root_cause": "<one sentence>",
   "confidence": "HIGH | MEDIUM | LOW | UNKNOWN",
   "culprit": {
-    "type": "deploy | upstream | database | traffic | infrastructure | unknown",
-    "detail": "<specific detail: deploy #, commit SHA, service name, metric value>",
+    "type": "deploy | feature_flag | upstream | database | traffic | infrastructure | unknown",
+    "detail": "<specific detail: deploy #, flag key, commit SHA, service name, metric value>",
     "diff_url": "<URL if deploy found, else null>"
   },
   "affected_services": ["<service1>", "<service2>"],
@@ -71,6 +73,9 @@ COLLECTED DATA
 
 ## Database Health (RDS)
 {rds_data}
+
+## Feature Flag Changes (LaunchDarkly)
+{launchdarkly_data}
 
 ## Unavailable Sources
 {unavailable_sources}

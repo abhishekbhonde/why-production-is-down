@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # Anthropic
     anthropic_api_key: str = ""
 
+    # LaunchDarkly
+    launchdarkly_api_key: str = ""
+    launchdarkly_env: str = "production"  # environment slug to scope audit log queries
+
     # Persistence
     db_path: str = "data/incidents.db"
 

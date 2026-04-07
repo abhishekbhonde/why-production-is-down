@@ -1,0 +1,18 @@
+{
+  "flag_changes": [
+    {
+      "flag_key": "payment-service-new-checkout-flow",
+      "description": "Turned on flag 'payment-service-new-checkout-flow' for 100% of users in production",
+      "changed_at": "2024-01-15T02:41:00",
+      "changed_by": "jsmith@acme.com",
+      "resources": ["proj/acme:env/production:flag/payment-service-new-checkout-flow"]
+    },
+    {
+      "flag_key": "payment-service-stripe-v2",
+      "description": "Enabled flag 'payment-service-stripe-v2' for internal users",
+      "changed_at": "2024-01-15T02:44:30",
+      "changed_by": "alice@acme.com",
+      "resources": ["proj/acme:env/production:flag/payment-service-stripe-v2"]
+    }
+  ]
+}

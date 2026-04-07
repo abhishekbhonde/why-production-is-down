@@ -13,6 +13,7 @@ from src.adapters.base import AdapterResult
 from src.adapters.cloudwatch import CloudWatchAdapter
 from src.adapters.datadog import DatadogAdapter
 from src.adapters.github import GitHubAdapter
+from src.adapters.launchdarkly import LaunchDarklyAdapter
 from src.adapters.rds import RDSAdapter
 from src.adapters.sentry import SentryAdapter
 from src.agent.prompts import INVESTIGATION_PROMPT_TEMPLATE, SYSTEM_PROMPT
@@ -54,6 +55,7 @@ class Orchestrator:
         self._cloudwatch = CloudWatchAdapter()
         self._github = GitHubAdapter()
         self._rds = RDSAdapter()
+        self._launchdarkly = LaunchDarklyAdapter()
         self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
     async def investigate(self, alert: Alert) -> InvestigationReport:
@@ -69,9 +71,10 @@ class Orchestrator:
             self._cloudwatch.fetch(alert.service, window_start, window_end),
             self._github.fetch(alert.service, window_start, window_end),
             self._rds.fetch(alert.service, window_start, window_end),
+            self._launchdarkly.fetch(alert.service, window_start, window_end),
         )
 
-        datadog_result, sentry_result, cloudwatch_result, github_result, rds_result = results
+        datadog_result, sentry_result, cloudwatch_result, github_result, rds_result, ld_result = results
 
         unavailable = [r.source for r in results if not r.ok]
 
@@ -84,8 +87,9 @@ class Orchestrator:
                 self._cloudwatch.fetch(alert.service, expanded_start, window_end),
                 self._github.fetch(alert.service, expanded_start, window_end),
                 self._rds.fetch(alert.service, expanded_start, window_end),
+                self._launchdarkly.fetch(alert.service, expanded_start, window_end),
             )
-            datadog_result, sentry_result, cloudwatch_result, github_result, rds_result = results
+            datadog_result, sentry_result, cloudwatch_result, github_result, rds_result, ld_result = results
 
         prompt = INVESTIGATION_PROMPT_TEMPLATE.format(
             service=alert.service,
@@ -99,6 +103,7 @@ class Orchestrator:
             cloudwatch_data=truncate_for_llm(cloudwatch_result.data, max_lines=settings.max_log_lines),
             github_data=truncate_for_llm(github_result.data, max_lines=settings.max_diff_lines),
             rds_data=truncate_for_llm(rds_result.data, max_lines=100),
+            launchdarkly_data=truncate_for_llm(ld_result.data, max_lines=50),
             unavailable_sources=", ".join(unavailable) if unavailable else "none",
         )
 

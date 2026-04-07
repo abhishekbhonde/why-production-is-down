@@ -1,0 +1,12 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+# Install dependencies from the project manifest
+COPY pyproject.toml .
+RUN pip install --no-cache-dir .
+
+# Copy application source and Lambda entrypoint
+COPY src/ ./src/
+COPY deploy/lambda_handler.py ./lambda_handler.py
+
+# Mangum wraps the FastAPI app — Lambda calls handler.handler
+CMD ["lambda_handler.handler"]
