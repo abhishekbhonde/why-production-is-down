@@ -66,8 +66,6 @@ async def init() -> None:
 
 async def save_investigation(report) -> str:
     """Persists an InvestigationReport. Returns the investigation ID."""
-    from src.agent.orchestrator import InvestigationReport  # avoid circular import
-
     inv_id = f"{report.service}:{report.alert_time}"
     culprit = report.culprit or {}
 

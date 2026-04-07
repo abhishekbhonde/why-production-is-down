@@ -2,12 +2,10 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import anthropic
-
-logger = logging.getLogger(__name__)
 
 from src.adapters.base import AdapterResult
 from src.adapters.cloudwatch import CloudWatchAdapter
@@ -19,6 +17,8 @@ from src.adapters.sentry import SentryAdapter
 from src.agent.prompts import INVESTIGATION_PROMPT_TEMPLATE, SYSTEM_PROMPT
 from src.config import settings
 from src.utils.truncate import truncate_for_llm
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

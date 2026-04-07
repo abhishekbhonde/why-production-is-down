@@ -1,7 +1,7 @@
 """Adapter tests — run entirely against fixture data, no real API calls."""
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from src.adapters.datadog import DatadogAdapter
 from src.adapters.sentry import SentryAdapter
