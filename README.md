@@ -14,6 +14,8 @@ This agent does it automatically the moment an alert fires — it reads your log
 
 You wake up knowing exactly what to fix.
 
+> **New to this project?** Read the [complete usage guide →](USAGE.md) for step-by-step setup, configuration, deployment, and day-to-day usage instructions.
+
 ---
 
 ## How It Works
