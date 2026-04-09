@@ -16,6 +16,8 @@ from src.adapters.rds import RDSAdapter
 from src.adapters.sentry import SentryAdapter
 from src.agent.prompts import INVESTIGATION_PROMPT_TEMPLATE, SYSTEM_PROMPT
 from src.config import settings
+from src.store import db as store
+from src.utils.timeline import correlate, extract_events
 from src.utils.truncate import truncate_for_llm
 
 logger = logging.getLogger(__name__)
@@ -91,6 +93,39 @@ class Orchestrator:
             )
             datadog_result, sentry_result, cloudwatch_result, github_result, rds_result, ld_result = results
 
+        # Build correlated timeline from all adapter results
+        all_events = []
+        for result, src in (
+            (datadog_result, "datadog"),
+            (sentry_result, "sentry"),
+            (github_result, "github"),
+        ):
+            if result.ok and result.data:
+                all_events.extend(extract_events(result.data, src))
+        timeline = correlate(all_events)
+        timeline_summary = (
+            "\n".join(
+                f"[{e.timestamp.isoformat()}] {e.source.upper()}: {e.description}"
+                for e in timeline
+            )
+            if timeline
+            else "No timestamped events extracted."
+        )
+
+        # Fetch systematic misses to tune the prompt
+        try:
+            misses = await store.get_systematic_misses()
+        except Exception:
+            misses = []
+        if misses:
+            past_mistakes = "\n".join(
+                f"- {m['culprit_type']} was incorrectly identified {m['incorrect_count']} time(s) "
+                f"(e.g. '{m['example_detail']}'). Be extra cautious before blaming this type."
+                for m in misses
+            )
+        else:
+            past_mistakes = "No systematic misses recorded yet."
+
         prompt = INVESTIGATION_PROMPT_TEMPLATE.format(
             service=alert.service,
             alert_time=alert.alert_time.isoformat(),
@@ -98,6 +133,7 @@ class Orchestrator:
             severity=alert.severity,
             window_start=window_start.isoformat(),
             window_end=window_end.isoformat(),
+            timeline_summary=timeline_summary,
             datadog_data=truncate_for_llm(datadog_result.data, max_lines=settings.max_log_lines),
             sentry_data=truncate_for_llm(sentry_result.data, max_lines=settings.max_log_lines),
             cloudwatch_data=truncate_for_llm(cloudwatch_result.data, max_lines=settings.max_log_lines),
@@ -105,6 +141,7 @@ class Orchestrator:
             rds_data=truncate_for_llm(rds_result.data, max_lines=100),
             launchdarkly_data=truncate_for_llm(ld_result.data, max_lines=50),
             unavailable_sources=", ".join(unavailable) if unavailable else "none",
+            past_mistakes=past_mistakes,
         )
 
         message = await self._client.messages.create(

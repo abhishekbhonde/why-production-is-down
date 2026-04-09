@@ -223,40 +223,47 @@ why-production-is-down/
 ## Implementation Phases
 
 ### Phase 1 — Skeleton
-- [ ] FastAPI webhook receiver with PagerDuty and Datadog signature validation
-- [ ] Redis deduplication (same alert within 5 minutes = one investigation)
-- [ ] Agent loop with stubbed adapters returning fixture data
-- [ ] Hypothesis testing logic with prioritized root cause search
-- [ ] Slack output with structured report format
+- [x] FastAPI webhook receiver with PagerDuty and Datadog signature validation
+- [x] Redis deduplication (same alert within 5 minutes = one investigation)
+- [x] Agent loop with stubbed adapters returning fixture data
+- [x] Hypothesis testing logic with prioritized root cause search
+- [x] Slack output with structured report format
 
 **Goal:** End-to-end flow works with fixture data. No real API calls.
 
 ### Phase 2 — Real Integrations
-- [ ] Live Datadog adapter: error rate metrics + log search
-- [ ] Live Sentry adapter: error groups + release tracking
-- [ ] Live GitHub adapter: deploy tags + commit diffs
-- [ ] Live CloudWatch adapter: ECS/Lambda logs + RDS metrics
-- [ ] Rate limit handling for all adapters (Datadog: 300 req/hr, GitHub: 5000 req/hr)
-- [ ] Validated against 3 real past incidents in staging
+- [x] Live Datadog adapter: error rate metrics + log search
+- [x] Live Sentry adapter: error groups + release tracking
+- [x] Live GitHub adapter: deploy tags + commit diffs
+- [x] Live CloudWatch adapter: ECS/Lambda logs + RDS metrics
+- [x] Rate limit handling for all adapters (Datadog: 300 req/hr, GitHub: 5000 req/hr)
+- [ ] Validated against 3 real past incidents in staging *(QA activity — requires live environment)*
 
 **Goal:** Correctly identify root cause for real historical incidents.
 
 ### Phase 3 — Reliability
-- [ ] 90-second hard timeout on full investigation
-- [ ] Per-adapter 10-second timeout with graceful skip
-- [ ] Alert storm handling via SQS queue with 60-second delay
-- [ ] S3 + email fallback if Slack delivery fails
-- [ ] Investigation window auto-expansion (30min → 2hr) on no-signal
-- [ ] Cost tracking: log token count and estimated cost per investigation
+- [x] 90-second hard timeout on full investigation
+- [x] Per-adapter 10-second timeout with graceful skip
+- [x] Alert storm handling via SQS queue with 60-second delay
+- [x] S3 + email fallback if Slack delivery fails
+- [x] Investigation window auto-expansion (30min → 2hr) on no-signal
+- [x] Cost tracking: log token count and estimated cost per investigation
 
 **Goal:** Production-ready. Handles all edge cases without human intervention.
 
 ### Phase 4 — Learning
-- [ ] Persist `(investigation, outcome)` pairs to a database
-- [ ] "Was this correct?" Slack button (thumbs up / thumbs down)
-- [ ] Weekly accuracy report: % of incidents where root cause was correct
-- [ ] Tune investigation prompts based on systematic misses
-- [ ] Auto-annotate PagerDuty incidents that were resolved by rolling back the identified deploy
+- [x] Persist `(investigation, outcome)` pairs to a database
+- [x] "Was this correct?" Slack button (thumbs up / thumbs down)
+- [x] Weekly accuracy report: % of incidents where root cause was correct
+- [x] Tune investigation prompts based on systematic misses
+- [x] Auto-annotate PagerDuty incidents that were resolved by rolling back the identified deploy
+
+### Phase 5 — One-Click Rollback
+- [x] "Roll back deploy" button in Slack (HIGH confidence deploy culprits only)
+- [x] Confirmation dialog before any action is taken
+- [x] Creates a draft revert PR on GitHub; warns if newer commits landed after the bad deploy
+- [x] Posts PR URL back into the Slack thread
+- [x] Annotates the PagerDuty incident with the rollback PR URL
 
 ---
 

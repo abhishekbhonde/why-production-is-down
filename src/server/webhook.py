@@ -150,7 +150,7 @@ async def _run_investigation(alert: Alert) -> None:
 
         # Notify via Slack (with feedback buttons) or fall back to S3 + email
         try:
-            await slack_notifier.send(report, investigation_id)
+            await slack_notifier.send(report, investigation_id, incident_id=alert.incident_id)
         except SlackDeliveryError as exc:
             logger.warning("Slack delivery failed (%s), falling back to S3 + email", exc)
             s3_url = await s3_notifier.upload(report)
@@ -173,8 +173,8 @@ async def _run_investigation(alert: Alert) -> None:
 # Rollback helper
 # ---------------------------------------------------------------------------
 
-async def _do_rollback(sha: str, repo: str, channel_id: str, thread_ts: str) -> None:
-    """Creates a GitHub revert PR and posts the result back to the Slack thread."""
+async def _do_rollback(sha: str, repo: str, channel_id: str, thread_ts: str, incident_id: str = "") -> None:
+    """Creates a GitHub revert PR, posts the result to Slack, and annotates PagerDuty."""
     try:
         pr_url = await create_revert_pr(repo, sha)
         await slack_notifier.post_thread_reply(
@@ -182,6 +182,13 @@ async def _do_rollback(sha: str, repo: str, channel_id: str, thread_ts: str) -> 
             thread_ts,
             f":white_check_mark: Revert PR created: {pr_url}\nReview and merge to roll back the deploy.",
         )
+        # Annotate the PagerDuty incident so responders know a rollback PR was opened
+        if incident_id:
+            await _pagerduty.annotate_incident(
+                incident_id,
+                f"Rollback initiated: revert PR created at {pr_url}\n"
+                f"Reverts commit {sha}. Review and merge to resolve the incident.",
+            )
     except Exception:
         logger.exception("Failed to create revert PR for %s@%s", repo, sha)
         await slack_notifier.post_thread_reply(
@@ -354,11 +361,14 @@ async def slack_interactive(
         return JSONResponse(content={"text": ack_text})
 
     if action_id == "rollback_deploy":
-        # value format: "{sha}|{repo}"
-        sha, _, repo = value.partition("|")
+        # value format: "{sha}|{repo}|{incident_id}"
+        parts = value.split("|", 2)
+        sha = parts[0] if len(parts) > 0 else ""
+        repo = parts[1] if len(parts) > 1 else ""
+        incident_id = parts[2] if len(parts) > 2 else ""
         channel_id = payload.get("container", {}).get("channel_id", "")
         thread_ts = payload.get("container", {}).get("message_ts", "")
-        asyncio.create_task(_do_rollback(sha, repo, channel_id, thread_ts))
+        asyncio.create_task(_do_rollback(sha, repo, channel_id, thread_ts, incident_id))
         return JSONResponse(content={"text": ":hourglass_flowing_sand: Creating revert PR, hang tight..."})
 
     return JSONResponse(content={"status": "unknown_action"})

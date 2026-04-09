@@ -119,6 +119,44 @@ async def record_feedback(investigation_id: str, verdict: str) -> None:
     logger.info("Feedback recorded: %s → %s", investigation_id, verdict)
 
 
+async def get_systematic_misses(min_count: int = 3) -> list[dict]:
+    """Returns culprit types repeatedly marked incorrect in the last 30 days.
+
+    Used to inject past-mistake hints into the investigation prompt so the
+    agent avoids repeating the same misdiagnoses.
+
+    Returns a list of dicts: [{culprit_type, incorrect_count, example_detail}]
+    Only includes types with at least min_count incorrect verdicts.
+    """
+    async with aiosqlite.connect(_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT i.culprit_type, COUNT(*) AS n, MAX(i.culprit_detail) AS example
+            FROM feedback f
+            JOIN investigations i ON i.id = f.investigation_id
+            WHERE f.verdict = 'incorrect'
+              AND i.created_at >= datetime('now', '-30 days')
+              AND i.culprit_type != ''
+              AND i.culprit_type != 'unknown'
+            GROUP BY i.culprit_type
+            HAVING COUNT(*) >= ?
+            ORDER BY n DESC
+            """,
+            (min_count,),
+        )
+        rows = await cur.fetchall()
+
+    return [
+        {
+            "culprit_type": r["culprit_type"],
+            "incorrect_count": r["n"],
+            "example_detail": r["example"] or "",
+        }
+        for r in rows
+    ]
+
+
 async def weekly_accuracy() -> dict:
     """Returns accuracy stats for the past 7 days.
 
