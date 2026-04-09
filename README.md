@@ -436,7 +436,3 @@ INVESTIGATION_TIMEOUT_SECONDS=90   # hard limit on full investigation
 Each adapter must implement the `BaseAdapter` interface defined in `src/adapters/base.py` and handle its own timeout and error suppression.
 
 ---
-
-## License
-
-MIT
