@@ -40,7 +40,7 @@ def test_rollback_value_extracts_sha_and_repo():
         "diff_url": "https://github.com/acme-corp/payment-service/compare/f1e2d3c...a3f8c21",
     }
     val = _rollback_value(culprit)
-    assert val == "a3f8c21|acme-corp/payment-service"
+    assert val == "a3f8c21|acme-corp/payment-service|"
 
 
 def test_rollback_value_returns_none_for_non_deploy():
@@ -103,7 +103,7 @@ def test_rollback_button_value_encodes_sha_and_repo():
         if block.get("type") == "actions":
             for el in block["elements"]:
                 if el.get("action_id") == "rollback_deploy":
-                    assert el["value"] == "a3f8c21|acme-corp/payment-service"
+                    assert el["value"] == "a3f8c21|acme-corp/payment-service|"
                     return
     pytest.fail("rollback_deploy button not found")
 

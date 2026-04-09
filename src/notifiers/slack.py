@@ -33,18 +33,18 @@ _GITHUB_COMPARE_RE = re.compile(
 )
 
 
-def _rollback_value(culprit: dict) -> str | None:
-    """Returns '{sha}|{repo}' if the culprit is a deploy with a parseable diff URL."""
+def _rollback_value(culprit: dict, incident_id: str = "") -> str | None:
+    """Returns '{sha}|{repo}|{incident_id}' if the culprit is a deploy with a parseable diff URL."""
     if culprit.get("type") != "deploy":
         return None
     m = _GITHUB_COMPARE_RE.match(culprit.get("diff_url") or "")
     if not m:
         return None
     repo, sha = m.group(1), m.group(2)
-    return f"{sha}|{repo}"
+    return f"{sha}|{repo}|{incident_id}"
 
 
-def _format_report(report: InvestigationReport, investigation_id: str = "") -> list[dict]:
+def _format_report(report: InvestigationReport, investigation_id: str = "", incident_id: str = "") -> list[dict]:
     """Formats the report as Slack Block Kit blocks."""
     emoji = CONFIDENCE_EMOJI.get(report.confidence, ":question:")
 
@@ -119,7 +119,7 @@ def _format_report(report: InvestigationReport, investigation_id: str = "") -> l
 
         # Rollback button — only for HIGH confidence deploy culprits with a diff URL
         if report.confidence == "HIGH":
-            rollback_val = _rollback_value(report.culprit or {})
+            rollback_val = _rollback_value(report.culprit or {}, incident_id)
             if rollback_val:
                 elements.append(
                     {
@@ -145,9 +145,9 @@ def _format_report(report: InvestigationReport, investigation_id: str = "") -> l
     return blocks
 
 
-async def send(report: InvestigationReport, investigation_id: str = "") -> None:
+async def send(report: InvestigationReport, investigation_id: str = "", incident_id: str = "") -> None:
     if settings.mock_mode:
-        logger.info("[MOCK] Slack report:\n%s", _format_report(report, investigation_id))
+        logger.info("[MOCK] Slack report:\n%s", _format_report(report, investigation_id, incident_id))
         return
 
     async with httpx.AsyncClient() as client:
@@ -156,7 +156,7 @@ async def send(report: InvestigationReport, investigation_id: str = "") -> None:
             headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
             json={
                 "channel": settings.slack_channel_id,
-                "blocks": _format_report(report, investigation_id),
+                "blocks": _format_report(report, investigation_id, incident_id),
                 "text": f"Incident report for {report.service}: {report.root_cause}",
             },
             timeout=10,
